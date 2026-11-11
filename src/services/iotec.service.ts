@@ -1,0 +1,1752 @@
+import { Injectable, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import { HttpService } from '@nestjs/axios';
+import { firstValueFrom } from 'rxjs';
+import { request } from 'undici';
+import Redis from 'ioredis';
+import { WalletService } from './wallet.service';
+import { PlatformRevenueRepository } from '../repositories/platform-revenue.repository';
+import { domainToASCII } from 'url';
+
+@Injectable()
+export class IotecService {
+  private readonly logger = new Logger(IotecService.name);
+  private baseUrl = process.env.IOTEC_BASE_URL || 'https://pay.iotec.io/api';
+  private clientId = process.env.IOTEC_CLIENT_ID || '';
+  private clientSecret = process.env.IOTEC_CLIENT_SECRET || '';
+  private walletId = process.env.IOTEC_WALLET_ID;
+  private redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+  private accessToken: string;
+  private tokenExpiry: number;
+
+  constructor(
+    private readonly http: HttpService,
+    private readonly walletService: WalletService,
+    private readonly platformRevenueRepository: PlatformRevenueRepository,
+  ) {}
+
+  /**
+   * Get access token from IOTEC identity server
+   * Uses client credentials flow with form-urlencoded
+   */
+  async getAccessToken(): Promise<string> {
+    // In-memory cache check
+    if (this.accessToken && Date.now() < this.tokenExpiry) {
+      return this.accessToken;
+    }
+
+    // Check Redis cache for existing token
+    const cachedToken = await this.redis.get('iotec_access_token');
+    if (cachedToken) {
+      this.accessToken = cachedToken;
+      // Set expiry to 1 minute from now (tokens are short-lived)
+      this.tokenExpiry = Date.now() + 60 * 1000;
+      return cachedToken;
+    }
+  
+    // If no cached token, get new one from IOTEC identity server
+    // Using form-urlencoded as required by the API
+    const params = new URLSearchParams();
+    params.append('client_id', this.clientId);
+    params.append('client_secret', this.clientSecret);
+    params.append('grant_type', 'client_credentials');
+
+    const { statusCode, body } = await request('https://id.iotec.io/connect/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: params.toString(),
+    });
+
+    const responseBody = await body.json() as any;
+
+    if (statusCode >= 400) {
+      this.logger.error(`Failed to get access token: ${JSON.stringify(responseBody)}`);
+      throw new HttpException(
+        responseBody || 'Failed to get access token',
+        statusCode,
+      );
+    }
+  
+    const { access_token, expires_in } = responseBody;
+  
+    this.accessToken = access_token;
+    this.tokenExpiry = Date.now() + expires_in * 1000;
+  
+    // Redis cache (slightly shorter TTL for safety)
+    await this.redis.set(
+      'iotec_access_token',
+      access_token,
+      'EX',
+      expires_in - 30,
+    );
+  
+    return access_token;
+  }
+
+  /**
+   * Get headers with valid access token
+   */
+  async getHeaders() {
+    const token = await this.getAccessToken();
+    return {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
+  }
+
+  /**
+   * Collect funds from client via IOTEC collections API
+   * Uses undici for HTTP requests
+   * Response structure includes: id, status, statusCode, statusMessage, transactions[], etc.
+   */
+  async collectClientFunds(data: {
+    amount: number;
+    payer: string;
+    externalId: string;
+    payerNote?: string;
+    payeeNote?: string;
+    currency?: string;
+    category?: string;
+    walletId:string;
+    transactionChargesCategory?: string;
+  }) {
+    try {
+      const reference = data.externalId || `collect-${Date.now()}`;
+      
+      // Store reference in Redis for tracking
+      await this.redis.set(`transaction:${reference}:type`, 'collection', 'EX', 86400);
+      await this.redis.set(`transaction:${reference}:payer`, data.payer, 'EX', 86400);
+      await this.redis.set(`cached-voucher`,'zero'); 
+
+      const payload = {
+        category: data.category || 'MobileMoney',
+        currency: data.currency || 'ITX',
+        walletId:this.walletId,
+        externalId: data.externalId,
+        payer: data.payer,
+        payerNote: data.payerNote || 'Payment collection',
+        amount: data.amount,
+        payeeNote: data.payeeNote || '',
+        channel: null,
+        transactionChargesCategory: data.transactionChargesCategory || 'ChargeWallet',
+      };
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request('https://pay.iotec.io/api/collections/collect', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(payload),
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Collection failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Collection request failed',
+          statusCode,
+        );
+      }
+
+      // Cache the transaction result using the response structure
+      // Response has: id, status, statusCode, statusMessage, transactions[], etc.
+      const transactionId = responseBody?.id;
+      if (transactionId) {
+        await this.redis.set(
+          `transaction:${transactionId}:status`,
+          responseBody.status || 'Pending',
+          'EX',
+          86400,
+        );
+        await this.redis.set(
+          `transaction:${transactionId}:reference`,
+          reference,
+          'EX',
+          86400,
+        );
+        await this.redis.set(
+          `transaction:${transactionId}:payer`,
+          data.payer,
+          'EX',
+          86400,
+        );
+        // Cache additional useful fields from response
+        if (responseBody.statusCode) {
+          await this.redis.set(
+            `transaction:${transactionId}:statusCode`,
+            responseBody.statusCode,
+            'EX',
+            86400,
+          );
+        }
+        if (responseBody.statusMessage) {
+          await this.redis.set(
+            `transaction:${transactionId}:statusMessage`,
+            responseBody.statusMessage,
+            'EX',
+            86400,
+          );
+        }
+      }
+
+      this.logger.log(`Collection initiated: ${reference} from ${data.payer}, status: ${responseBody?.status}, statusCode: ${responseBody?.statusCode}`);
+
+      // Waiting for a voucher value to be dropped in cache with proper polling
+      const maxWaitTime = 60000; // 60 seconds max wait time
+      const pollInterval = 2000; // 2 seconds between checks
+      const startTime = Date.now();
+      let voucherCode = await this.redis.get('cached-voucher');
+      
+      while (voucherCode === 'zero' && (Date.now() - startTime) < maxWaitTime) {
+        console.log('waiting for a voucher...');
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+        voucherCode = await this.redis.get('cached-voucher');
+      }
+      
+      if (voucherCode === 'zero' || !voucherCode) {
+        console.log('voucher wait timed out or no voucher available');
+        voucherCode = null;
+      } else {
+        console.log('voucher obtained...continuing');
+        voucherCode=await this.redis.get('cached-voucher');
+
+        if(voucherCode=='null'){
+            voucherCode=null;
+        }
+
+        // Update responseBody status to reflect success after voucher is obtained
+        if (voucherCode && voucherCode !== 'zero') {
+          responseBody.status = 'Success';
+          responseBody.statusCode = 200;
+          responseBody.statusMessage = 'Voucher collected successfully';
+          
+          // Also update Redis cache with success status
+          if (transactionId) {
+            await this.redis.set(
+              `transaction:${transactionId}:status`,
+              'Success',
+              'EX',
+              86400,
+            );
+            await this.redis.set(
+              `transaction:${transactionId}:statusCode`,
+              '200',
+              'EX',
+              86400,
+            );
+          }
+        }
+
+        await this.redis.set(`cached-voucher`, 'zero');
+      } 
+      
+      // Return comprehensive response matching IOTEC API structure
+      return { 
+        result: responseBody, 
+        code: voucherCode,
+        // Core transaction fields
+        transactionId: responseBody?.id,
+        status: responseBody?.status,
+        statusCode: responseBody?.statusCode,
+        statusMessage: responseBody?.statusMessage,
+        // Transaction details
+        amount: responseBody?.amount,
+        currency: responseBody?.currency,
+        externalId: responseBody?.externalId,
+        category: responseBody?.category,
+        paymentChannel: responseBody?.paymentChannel,
+        // Payee/Payer info
+        payee: responseBody?.payee,
+        payeeName: responseBody?.payeeName,
+        payeeUploadName: responseBody?.payeeUploadName,
+        nameStatus: responseBody?.nameStatus,
+        // Charges
+        transactionCharge: responseBody?.transactionCharge,
+        vendorCharge: responseBody?.vendorCharge,
+        totalTransactionCharge: responseBody?.totalTransactionCharge,
+        // Vendor info
+        vendor: responseBody?.vendor,
+        vendorTransactionId: responseBody?.vendorTransactionId,
+        // Timestamps
+        createdAt: responseBody?.createdAt,
+        processedAt: responseBody?.processedAt,
+        lastUpdated: responseBody?.lastUpdated,
+        sendAt: responseBody?.sendAt,
+        // Bank details (if applicable)
+        bankId: responseBody?.bankId,
+        bank: responseBody?.bank,
+        bankTransferType: responseBody?.bankTransferType,
+        // Approval info
+        approvalDecision: responseBody?.approvalDecision,
+        decisionMadeBy: responseBody?.decisionMadeBy,
+        decisionMadeByData: responseBody?.decisionMadeByData,
+        decisionMadeAt: responseBody?.decisionMadeAt,
+        decisionRemarks: responseBody?.decisionRemarks,
+        decisions: responseBody?.decisions,
+        // Wallet info
+        wallet: responseBody?.wallet,
+        // Bulk processing
+        bulkId: responseBody?.bulkId,
+        internalRequestId: responseBody?.internalRequestId,
+        // Transactions array
+        transactions: responseBody?.transactions,
+      };
+
+    } catch (error) {
+      this.logger.error(`Collection failed: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Collection failed',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  async collectWallet(data: {
+    amount: number;
+    payer: string;
+    externalId: string;
+    payerNote?: string;
+    payeeNote?: string;
+    currency?: string;
+    category?: string;
+    transactionChargesCategory?: string;
+    fromWallet: string;
+    toWallet: string;
+  }) {
+    try {
+      if(data.fromWallet=='' || data.toWallet==''){
+        this.logger.error(`invalid wallet codes obtained....aborting`);
+        throw new HttpException('invalid wallet codes recieved',111);
+      }
+
+      const reference = data.externalId || `collect-wallet-${Date.now()}`;
+      
+      await this.redis.set(`transaction:${reference}:type`, 'wallet-collection', 'EX', 86400);
+      await this.redis.set(`transaction:${reference}:payer`, data.payer, 'EX', 86400);
+      await this.redis.set(`transaction:${reference}:fromWallet`, data.fromWallet, 'EX', 86400);
+      await this.redis.set(`transaction:${reference}:toWallet`, data.toWallet, 'EX', 86400);
+
+      const payload = {
+        category: data.category || 'Wallet',
+        currency: data.currency || 'ITX',
+        walletId: this.walletId,
+        externalId: data.externalId,
+        payer: data.fromWallet,
+        payerNote: data.payerNote || 'Wallet collection',
+        amount: data.amount,
+        payeeNote: data.payeeNote || '',
+        channel: null,
+        transactionChargesCategory: data.transactionChargesCategory || 'ChargeWallet',
+      };
+
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request('https://pay.iotec.io/api/collections/collect', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(payload),
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Wallet collection failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Wallet collection request failed',
+          statusCode,
+        );
+      }
+
+      const transactionId = responseBody?.id;
+      if (transactionId) {
+        await this.redis.set(
+          `transaction:${transactionId}:status`,
+          responseBody.status || 'Pending',
+          'EX',
+          86400,
+        );
+        await this.redis.set(
+          `transaction:${transactionId}:reference`,
+          reference,
+          'EX',
+          86400,
+        );
+        await this.redis.set(
+          `transaction:${transactionId}:fromWallet`,
+          data.fromWallet,
+          'EX',
+          86400,
+        );
+        await this.redis.set(
+          `transaction:${transactionId}:toWallet`,
+          data.toWallet,
+          'EX',
+          86400,
+        );
+      }
+
+      this.logger.log(`Wallet collection initiated: ${reference}, from: ${data.fromWallet}, to: ${data.toWallet}`);
+
+      return {
+        result: responseBody,
+        transactionId: responseBody?.id,
+        status: responseBody?.status,
+        statusCode: responseBody?.statusCode,
+        statusMessage: responseBody?.statusMessage,
+        amount: responseBody?.amount,
+        currency: responseBody?.currency,
+        fromWallet: data.fromWallet,
+        toWallet: data.toWallet,
+      };
+    } catch (error) {
+      this.logger.error(`Wallet collection failed: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Wallet collection failed',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  /**
+   * Collect funds from client for voucher print - polls for transaction status until Success
+   * This method does NOT wait for a voucher in Redis cache
+   * Instead, it continuously checks the transaction status until status == Success
+   */
+  async collectVoucherPrintFunds(data: {
+    amount: number;
+    payer: string;
+    externalId: string;
+    payerNote?: string;
+    payeeNote?: string;
+    currency?: string;
+    category?: string;
+    walletId: string;
+    transactionChargesCategory?: string;
+  }) {
+    try {
+      const reference = data.externalId || `collect-${Date.now()}`;
+      
+      // Store reference in Redis for tracking
+      await this.redis.set(`transaction:${reference}:type`, 'voucher-collection', 'EX', 86400);
+      await this.redis.set(`transaction:${reference}:payer`, data.payer, 'EX', 86400);
+
+      const payload = {
+        category: data.category || 'MobileMoney',
+        currency: data.currency || 'UGX',
+        walletId: process.env.IOTEC_WALLET_ID,
+        externalId: data.externalId,
+        payer: data.payer,
+        payerNote: data.payerNote || 'Payment collection for voucher',
+        amount: data.amount,
+        payeeNote: data.payeeNote || '',
+        channel: null,
+        transactionChargesCategory: data.transactionChargesCategory || 'ChargeWallet',
+      };
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request('https://pay.iotec.io/api/collections/collect', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(payload),
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Voucher collection failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Collection request failed',
+          statusCode,
+        );
+      }
+
+      // Cache the initial transaction result
+      const transactionId = responseBody?.id;
+      if (transactionId) {
+        await this.redis.set(
+          `transaction:${transactionId}:status`,
+          responseBody.status || 'Pending',
+          'EX',
+          86400,
+        );
+        await this.redis.set(
+          `transaction:${transactionId}:reference`,
+          reference,
+          'EX',
+          86400,
+        );
+        await this.redis.set(
+          `transaction:${transactionId}:payer`,
+          data.payer,
+          'EX',
+          86400,
+        );
+      }
+
+      this.logger.log(`Voucher collection initiated: ${reference} from ${data.payer}, transactionId: ${transactionId}`);
+
+      // Poll for transaction status until Success
+      const maxAttempts = 20; // 30 attempts max (60 seconds with 2s interval)
+      const pollInterval = 2000; // 2 seconds between checks
+      
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // Wait 2 seconds before checking status (except for first attempt)
+        if (attempt > 1) {
+          await new Promise(resolve => setTimeout(resolve, pollInterval));
+        }
+        
+        const statusResult = await this.getTransactionStatus(transactionId, 'collection');
+        const currentStatus = statusResult?.status;
+        const currentStatusCode = statusResult?.statusCode;
+        
+        this.logger.log(`Voucher transaction ${transactionId} status check ${attempt}/${maxAttempts}: ${currentStatus} (code: ${currentStatusCode})`);
+        
+        // Check if transaction is successful
+        if (currentStatus === 'Success' || currentStatusCode === 200) {
+          // Update Redis cache with success status
+          await this.redis.set(
+            `transaction:${transactionId}:status`,
+            'Success',
+            'EX',
+            86400,
+          );
+          await this.redis.set(
+            `transaction:${transactionId}:statusCode`,
+            '200',
+            'EX',
+            86400,
+          );
+
+            console.log('RESPONSE:',responseBody,"::::::");
+            const amountNum = parseFloat(String(responseBody.amount)) || 0;
+            const totalCharge = amountNum * 0.04;
+          
+          // Increment platform revenue with the collected amount
+          try {
+            const revenueAmount = amountNum - totalCharge;
+            console.log('REVENUE AMOUNT:', revenueAmount, typeof revenueAmount);
+         
+            await this.platformRevenueRepository.addRevenue(Number(revenueAmount));
+            this.logger.log(`Added ${revenueAmount} to platform revenue for transaction ${transactionId}`);
+          } catch (revenueError) {
+            this.logger.error(`Failed to add platform revenue: ${revenueError.message}`);
+          }
+
+          // Return successful response
+          return {
+            result: responseBody,
+            code: 200,
+            // Core transaction fields
+            transactionId: responseBody?.id,
+            status: 'Success',
+            statusCode: 200,
+            statusMessage: 'Payment collected successfully',
+            // Transaction details
+            amount: responseBody?.amount,
+            currency: responseBody?.currency,
+            externalId: responseBody?.externalId,
+            category: responseBody?.category,
+            paymentChannel: responseBody?.paymentChannel,
+            // Payee/Payer info
+            payee: responseBody?.payee,
+            payeeName: responseBody?.payeeName,
+            payer: data.payer,
+            // Charges
+            transactionCharge: responseBody?.transactionCharge,
+            vendorCharge: responseBody?.vendorCharge,
+            totalTransactionCharge: responseBody?.totalTransactionCharge,
+            // Vendor info
+            vendor: responseBody?.vendor,
+            vendorTransactionId: responseBody?.vendorTransactionId,
+            // Timestamps
+            createdAt: responseBody?.createdAt,
+            processedAt: responseBody?.processedAt,
+            lastUpdated: responseBody?.lastUpdated,
+          };
+        }
+        
+        // Check if transaction has failed
+        if (currentStatus === 'Failed' || currentStatus === 'Rejected' || currentStatusCode === 400 || currentStatusCode === 500) {
+          this.logger.error(`Voucher collection failed: ${currentStatus}`);
+          return {
+            result: responseBody,
+            code: currentStatusCode || 400,
+            transactionId: responseBody?.id,
+            status: currentStatus || 'Failed',
+            statusCode: currentStatusCode || 400,
+            statusMessage: statusResult?.statusMessage || 'Payment failed',
+            amount: responseBody?.amount,
+            currency: responseBody?.currency,
+            externalId: responseBody?.externalId,
+          };
+        }
+      }
+      
+      // If we've reached max attempts without success, return the last known status
+      const lastStatus = await this.getTransactionStatus(transactionId, 'collection');
+      this.logger.warn(`Voucher collection polling timed out after ${maxAttempts} attempts for transaction ${transactionId}`);
+      return {
+        result: responseBody,
+        code: lastStatus?.statusCode || 202,
+        transactionId: responseBody?.id,
+        status: lastStatus?.status || 'Pending',
+        statusCode: lastStatus?.statusCode || 202,
+        statusMessage: 'Payment is still being processed',
+        amount: responseBody?.amount,
+        currency: responseBody?.currency,
+        externalId: responseBody?.externalId,
+      };
+
+    } catch (error) {
+      this.logger.error(`Voucher collection failed: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Collection failed',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  /**
+   * Tiered withdrawal charge applied to every disbursement.
+   * Mirrors the schedule used by the platform payment service so a broker or
+   * admin withdrawal is charged consistently regardless of the entry point.
+   */
+  getWithdrawFee(amount: number): number {
+    if (amount >= 500 && amount <= 60000) return 700;
+    if (amount >= 60001 && amount <= 500000) return 1400;
+    if (amount >= 500001 && amount <= 1000000) return 2300;
+    if (amount >= 1000001 && amount <= 5000000) return 2800;
+    return 0;
+  }
+
+  /**
+   * Disburse funds to a mobile money number, deducting the withdrawal charge
+   * before the transfer is initiated.
+   *
+   * This is the single implementation shared by the `mobile-money` and
+   * `admin-mobile-money` controller endpoints.
+   *
+   * Notes:
+   * - The payee is NEVER looked up as a wallet holder. Customers on the
+   *   platform do not explicitly own wallets, so a payee wallet lookup says
+   *   nothing about whether the funds are available. Funding checks belong to
+   *   the calling service (broker held balance / admin platform balance).
+   * - The iotec gateway deducts its withdrawal charge on EVERY disbursement,
+   *   including refunds. The charge is taken off the top of the requested
+   *   amount, so the caller must request gross = net + charge for the payee
+   *   to receive the full amount it is owed.
+   * - The transaction row is saved after the disbursement has been initiated.
+   */
+  async disburseWithCharge(data: {
+    amount: number;
+    phoneNumber: string;
+    provider: 'MTN' | 'AIRTEL';
+    reference: string;
+    externalId?: string;
+    payeeName?: string;
+    payeeEmail?: string;
+    payerNote?: string;
+    payeeNote?: string;
+    payee: string;
+    currency?: string;
+    bankId?: string;
+    bankIdentificationCode?: string;
+    bankTransferType?: string;
+    sendAt?: string;
+    /** Transaction type recorded for tracking, e.g. 'mobile-money'. */
+    transactionType?: string;
+    /** Payment method recorded on the transaction row. */
+    paymentMethod?: string;
+  }) {
+    const grossAmount = Number(data.amount) || 0;
+    if (grossAmount <= 0) {
+      throw new HttpException('Amount must be greater than zero', HttpStatus.BAD_REQUEST);
+    }
+
+    const charge = this.getWithdrawFee(grossAmount);
+    const netAmount = grossAmount - charge;
+
+    if (netAmount <= 0) {
+      throw new HttpException(
+        `Amount UGX ${grossAmount.toLocaleString()} is too small to cover the UGX ${charge.toLocaleString()} withdrawal charge`,
+        HttpStatus.BAD_REQUEST,
+      );
+    }
+
+    const externalId = data.externalId || data.reference || `momo-${Date.now()}`;
+    const reference = data.reference || externalId;
+
+    // Store phone and reference in Redis for tracking
+    await this.redis.set(`transaction:${externalId}:phone`, data.phoneNumber, 'EX', 86400);
+    await this.redis.set(`transaction:${externalId}:type`, data.transactionType || 'mobile-money', 'EX', 86400);
+    await this.redis.set(`transaction:${externalId}:provider`, data.provider, 'EX', 86400);
+
+    // Build the payload for the disbursements API. The charge is withheld from
+    // the amount that actually reaches the payee.
+    const payload = {
+      category: 'MobileMoney',
+      currency: data.currency || 'ITX',
+      walletId: this.walletId,
+      externalId: externalId,
+      payeeName: data.payeeName || 'Customer',
+      payeeEmail: data.payeeEmail || null,
+      payee: data.payee,
+      amount: netAmount,
+      payerNote: data.payerNote || '',
+      payeeNote: data.payeeNote || '',
+      channel: null,
+      bankId: data.bankId || null,
+      bankIdentificationCode: data.bankIdentificationCode || null,
+      bankTransferType: data.bankTransferType || 'InternalTransfer',
+      sendAt: data.sendAt || new Date().toISOString(),
+    };
+
+    // Get valid access token
+    const headers = await this.getHeaders();
+
+    const { statusCode, body } = await request('https://pay.iotec.io/api/disbursements/disburse', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify(payload),
+    });
+
+    const responseBody = await body.json() as any;
+
+    if (statusCode >= 400) {
+      this.logger.error(`Disbursement failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+      throw new HttpException(
+        responseBody || 'Disbursement request failed',
+        statusCode,
+      );
+    }
+
+    const transactionId = responseBody?.id;
+
+    // Poll for the terminal status so the caller knows whether the money
+    // actually moved before it commits any ledger changes.
+    let status = responseBody?.status || 'Pending';
+    let statusResult: any = responseBody;
+
+    if (transactionId) {
+      await this.redis.set(
+        `transaction:${transactionId}:status`,
+        status,
+        'EX',
+        86400,
+      );
+
+      const maxAttempts = 3;
+      const pollInterval = 3000;
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (attempt > 1) {
+          await new Promise(resolve => setTimeout(resolve, pollInterval));
+        }
+
+        statusResult = await this.getTransactionStatus(transactionId);
+        status = statusResult?.status || status;
+
+        this.logger.log(`Transaction ${transactionId} status check ${attempt}/${maxAttempts}: ${status}`);
+
+        if (status === 'Success' || status === 'Failed' || status === 'Completed' || status === 'Rejected') {
+          break;
+        }
+      }
+    }
+
+    this.logger.log(
+      `Disbursement with charge: reference=${reference} gross=${grossAmount} charge=${charge} net=${netAmount} status=${status} transactionId=${transactionId}`,
+    );
+
+    return {
+      ...responseBody,
+      ...statusResult,
+      status,
+      transactionId,
+      reference,
+      originalAmount: grossAmount,
+      chargeDeducted: charge,
+      netAmount,
+      amount: netAmount,
+    };
+  }
+
+  /**
+   * Disburse funds to mobile money via IOTEC disbursements API
+   * Uses undici for HTTP requests
+   * Response structure includes: id, status, statusCode, statusMessage, transactions[], etc.
+   */
+  async walletToMobileMoney(data: {
+    amount: number;
+    phoneNumber: string;
+    provider: 'MTN' | 'AIRTEL';
+    reference: string;
+    externalId?: string;
+    payeeName?: string;
+    payeeEmail?: string;
+    payerNote?: string;
+    payeeNote?: string;
+    payee:string;
+    currency?: string;
+    bankId?: string;
+    bankIdentificationCode?: string;
+    bankTransferType?: string;
+    sendAt?: string;
+  }) {
+    try {
+      const externalId = data.externalId || data.reference || `momo-${Date.now()}`;
+      const PLATFORM_TAX_AMOUNT = 600;
+
+      // Store phone and reference in Redis for tracking
+      await this.redis.set(`transaction:${externalId}:phone`, data.phoneNumber, 'EX', 86400);
+      await this.redis.set(`transaction:${externalId}:type`, 'mobile-money', 'EX', 86400);
+      await this.redis.set(`transaction:${externalId}:provider`, data.provider, 'EX', 86400);
+
+      // Build the payload for the disbursements API
+      const payload = {
+        category: 'MobileMoney',
+        currency: data.currency || 'ITX',
+        walletId: this.walletId,
+        externalId: externalId,
+        payeeName: data.payeeName || 'Customer',
+        payeeEmail: data.payeeEmail || null,
+        payee: data.payee,
+        amount: (data.amount-PLATFORM_TAX_AMOUNT),
+        payerNote: data.payerNote || '',
+        payeeNote: data.payeeNote || '',
+        channel: null,
+        bankId: data.bankId || null,
+        bankIdentificationCode: data.bankIdentificationCode || null,
+        bankTransferType: data.bankTransferType || 'InternalTransfer',
+        sendAt: data.sendAt || new Date().toISOString(),
+      };
+
+      // Check wallet balance BEFORE making the disbursement request
+      try {
+        const wallet = await this.walletService.findByPhone(data.payee);
+        if (wallet) {
+          const walletBalance = wallet.balance || 0;
+          if (walletBalance < data.amount) {
+            this.logger.error(`Insufficient wallet balance for payee ${data.payee}. Required: ${data.amount}, Available: ${walletBalance}`);
+            throw new Error(`Insufficient wallet balance. Required: UGX ${data.amount.toLocaleString()}, Available: UGX ${walletBalance.toLocaleString()}`);
+          }
+          this.logger.log(`Wallet balance check passed for ${data.payee}. Balance: ${walletBalance}, Required: ${data.amount}`);
+        } else {
+          this.logger.warn(`Wallet not found for payee: ${data.payee}`);
+        }
+      } catch (walletCheckError) {
+        this.logger.error(`Wallet balance check failed: ${walletCheckError.message}`);
+        throw walletCheckError;
+      }
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request('https://pay.iotec.io/api/disbursements/disburse', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(payload),
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Disbursement failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Disbursement request failed',
+          statusCode,
+        );
+      }
+
+      // Cache the transaction result using the response structure
+      // Response has: id, status, statusCode, statusMessage, transactions[], etc.
+      const transactionId = responseBody?.id;
+      
+      if (transactionId) {
+        await this.redis.set(
+          `transaction:${transactionId}:status`,
+          responseBody.status || 'Pending',
+          'EX',
+          86400,
+        );
+        
+        // Poll for transaction status until it's Success or Failed
+        const maxAttempts = 3;
+        const pollInterval = 3000; // 3 seconds
+        
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          // Wait for 3 seconds before checking status (except for first attempt)
+          if (attempt > 1) {
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
+          }
+          
+          const statusResult = await this.getTransactionStatus(transactionId);
+          const currentStatus = statusResult?.status;
+          
+          this.logger.log(`Transaction ${transactionId} status check ${attempt}/${maxAttempts}: ${currentStatus}`);
+          
+          // Check if transaction is complete
+          if (currentStatus === 'Success' || currentStatus === 'Failed' || currentStatus === 'Completed' || currentStatus === 'Rejected') {
+            // If transaction is successful, deduct the amount from the payer's wallet
+            if (currentStatus === 'Success' || currentStatus === 'Completed') {
+              try {
+                const wallet = await this.walletService.findByPhone(data.payee);
+                if (wallet) {
+                  // Check if wallet has sufficient balance before deducting
+                  const walletBalance = wallet.balance || 0;
+                  if (walletBalance < data.amount) {
+                    this.logger.error(`Insufficient wallet balance for payee ${data.payee}. Required: ${data.amount}, Available: ${walletBalance}`);
+                    throw new Error(`Insufficient wallet balance. Required: UGX ${data.amount.toLocaleString()}, Available: UGX ${walletBalance.toLocaleString()}`);
+                  }
+                  
+                  // Deduct the amount (negative amount to subtract)
+                  await this.walletService.updateBalance(wallet.id, -data.amount);
+                  this.logger.log(`Deducted ${data.amount} from wallet ${wallet.id} for transaction ${transactionId}`);
+                } else {
+                  this.logger.warn(`Wallet not found for payee: ${data.payee}`);
+                }
+              } catch (walletError) {
+                this.logger.error(`Failed to deduct from wallet: ${walletError.message}`);
+                throw walletError; // Re-throw to fail the transaction
+              }
+            }
+            // Update the response body with final status from statusResult
+            return {
+              ...responseBody,
+              ...statusResult,
+              status: currentStatus,
+            };
+          }
+          
+          // If we've reached max attempts, return the last known status
+          if (attempt === maxAttempts) {
+            this.logger.warn(`Transaction ${transactionId} status polling timed out after ${maxAttempts} attempts`);
+            return {
+              ...responseBody,
+              ...statusResult,
+              status: currentStatus,
+            };
+          }
+        }
+      }
+      
+      return responseBody;
+    } catch (error) {
+      this.logger.error(`Mobile money disbursement failed: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Mobile money disbursement failed',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  /**
+   * Transfer funds between wallets via IOTEC disbursements API
+   * Uses undici for HTTP requests
+   * Response structure includes: id, status, statusCode, statusMessage, transactions[], etc.
+   */
+  async walletToWallet(data: {
+    amount: number;
+    reference: string;
+    fromWallet: string;
+    toWallet: string;
+    externalId?: string;
+    payeeName?: string;
+    payeeEmail?: string;
+    payerNote?: string;
+    payeeNote?: string;
+    currency?: string;
+    bankId?: string;
+    bankIdentificationCode?: string;
+    bankTransferType?: string;
+    sendAt?: string;
+  }) {
+    try {
+        if(data.fromWallet=='' || data.toWallet==''){
+          this.logger.error(`invalid wallet codes obtained....aborting`);
+          throw new HttpException('invalid wallet codes recieved',111);
+        }
+
+      const externalId = data.externalId || data.reference || `wallet-transfer-${Date.now()}`;
+
+      // Store reference in Redis for tracking
+      await this.redis.set(`transaction:${externalId}:type`, 'wallet-transfer', 'EX', 86400);
+      await this.redis.set(`transaction:${externalId}:fromWallet`, data.fromWallet, 'EX', 86400);
+      await this.redis.set(`transaction:${externalId}:toWallet`, data.toWallet, 'EX', 86400);
+
+      // Build the payload for the disbursements API
+      const payload = {
+        category: 'Wallet',
+        currency: data.currency || 'ITX',
+        walletId: this.walletId,
+        externalId: externalId,
+        payeeName: data.payeeName || 'Wallet Transfer',
+        payeeEmail: data.payeeEmail || null,
+        payee: data.toWallet,
+        amount: data.amount,
+        payerNote: data.payerNote || '',
+        payeeNote: data.payeeNote || '',
+        channel: null,
+        bankId: data.bankId || null,
+        bankIdentificationCode: data.bankIdentificationCode || null,
+        bankTransferType: data.bankTransferType || 'InternalTransfer',
+        sendAt: data.sendAt || new Date().toISOString(),
+      };
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request('https://pay.iotec.io/api/disbursements/disburse', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(payload),
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Wallet transfer failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Wallet transfer request failed',
+          statusCode,
+        );
+      }
+
+      // Cache the transaction result
+      const transactionId = responseBody?.id;
+      
+      if (transactionId) {
+        await this.redis.set(
+          `transaction:${transactionId}:status`,
+          responseBody.status || 'Pending',
+          'EX',
+          86400,
+        );
+        
+        // Poll for transaction status until it's Success or Failed
+        const maxAttempts = 10;
+        const pollInterval = 3000;
+        
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          if (attempt > 1) {
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
+          }
+          
+          const statusResult = await this.getTransactionStatus(transactionId);
+          const currentStatus = statusResult?.status;
+          
+          this.logger.log(`Wallet transfer ${transactionId} status check ${attempt}/${maxAttempts}: ${currentStatus}`);
+          
+          if (currentStatus === 'Success' || currentStatus === 'Failed' || currentStatus === 'Completed' || currentStatus === 'Rejected') {
+            return {
+              ...responseBody,
+              ...statusResult,
+              status: currentStatus,
+              fromWallet: data.fromWallet,
+              toWallet: data.toWallet,
+            };
+          }
+          
+          if (attempt === maxAttempts) {
+            this.logger.warn(`Wallet transfer ${transactionId} status polling timed out after ${maxAttempts} attempts`);
+            return {
+              ...responseBody,
+              ...statusResult,
+              status: currentStatus,
+              fromWallet: data.fromWallet,
+              toWallet: data.toWallet,
+            };
+          }
+        }
+      }
+      
+      return {
+        ...responseBody,
+        fromWallet: data.fromWallet,
+        toWallet: data.toWallet,
+      };
+    } catch (error) {
+      this.logger.error(`Wallet transfer failed: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Wallet transfer failed',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  /**
+   * Approve or reject a disbursement via IOTEC API
+   * Uses undici for HTTP requests
+   * Response structure includes: id, status, statusCode, statusMessage, approvalDecision, etc.
+   * Statuses: Pending, SentToVendor, Success, Failed, AwaitingApproval, RolledBack, Scheduled, Cancelled, Rejected
+   */
+  async approveOrRejectDisbursement(data: {
+    disbursementId: string;
+    decision: boolean;
+    remarks?: string;
+  }) {
+    try {
+      // Store disbursement ID in Redis for tracking
+      await this.redis.set(`disbursement:${data.disbursementId}:type`, 'approval', 'EX', 86400);
+      await this.redis.set(`disbursement:${data.disbursementId}:decision`, data.decision ? 'approved' : 'rejected', 'EX', 86400);
+
+      const payload = {
+        disbursementId: data.disbursementId,
+        decision: data.decision,
+        remarks: data.remarks || '',
+      };
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request('https://pay.iotec.io/api/disbursements/approve', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(payload),
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Disbursement approval failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Disbursement approval request failed',
+          statusCode,
+        );
+      }
+
+      // Cache the transaction result using the response structure
+      const transactionId = responseBody?.id;
+      if (transactionId) {
+        await this.redis.set(
+          `transaction:${transactionId}:status`,
+          responseBody.status || 'Pending',
+          'EX',
+          86400,
+        );
+        await this.redis.set(
+          `transaction:${transactionId}:statusCode`,
+          responseBody.statusCode || '',
+          'EX',
+          86400,
+        );
+        if (responseBody.statusMessage) {
+          await this.redis.set(
+            `transaction:${transactionId}:statusMessage`,
+            responseBody.statusMessage,
+            'EX',
+            86400,
+          );
+        }
+        if (responseBody.vendorTransactionId) {
+          await this.redis.set(
+            `transaction:${transactionId}:vendorTransactionId`,
+            responseBody.vendorTransactionId,
+            'EX',
+            86400,
+          );
+        }
+        // Cache approval-specific fields
+        if (responseBody.approvalDecision !== undefined) {
+          await this.redis.set(
+            `transaction:${transactionId}:approvalDecision`,
+            String(responseBody.approvalDecision),
+            'EX',
+            86400,
+          );
+        }
+        if (responseBody.decisionRemarks) {
+          await this.redis.set(
+            `transaction:${transactionId}:decisionRemarks`,
+            responseBody.decisionRemarks,
+            'EX',
+            86400,
+          );
+        }
+      }
+
+      this.logger.log(`Disbursement ${data.disbursementId} ${data.decision ? 'approved' : 'rejected'}, status: ${responseBody?.status}, statusCode: ${responseBody?.statusCode}`);
+      
+      return {
+        result: responseBody,
+        // Include key fields from response for convenience
+        transactionId: responseBody?.id,
+        status: responseBody?.status,
+        statusCode: responseBody?.statusCode,
+        statusMessage: responseBody?.statusMessage,
+        vendorTransactionId: responseBody?.vendorTransactionId,
+        amount: responseBody?.amount,
+        currency: responseBody?.currency,
+        payee: responseBody?.payee,
+        payeeName: responseBody?.payeeName,
+        approvalDecision: responseBody?.approvalDecision,
+        decisionMadeBy: responseBody?.decisionMadeBy,
+        decisionMadeByData: responseBody?.decisionMadeByData,
+        decisionMadeAt: responseBody?.decisionMadeAt,
+        decisionRemarks: responseBody?.decisionRemarks,
+        decisions: responseBody?.decisions,
+      };
+    } catch (error) {
+      this.logger.error(`Disbursement approval failed: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Disbursement approval failed',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  async walletToBank(data: {
+    amount: number;
+    accountNumber: string;
+    bankCode: string;
+    accountName: string;
+    reference: string;
+  }) {
+    try {
+      // Store reference in Redis for tracking
+      await this.redis.set(`transaction:${data.reference}:type`, 'bank-transfer', 'EX', 86400);
+      await this.redis.set(`transaction:${data.reference}:bank`, data.bankCode, 'EX', 86400);
+      await this.redis.set(`transaction:${data.reference}:account`, data.accountNumber, 'EX', 86400);
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const response = await firstValueFrom(
+        this.http.post(
+          `${this.baseUrl}/wallet/bank-transfer`,
+          data,
+          { headers: headers },
+        ),
+      );
+
+      // Cache the transaction result
+      if (response.data?.transactionId) {
+        await this.redis.set(
+          `transaction:${response.data.transactionId}:status`,
+          response.data.status || 'PENDING',
+          'EX',
+          86400,
+        );
+        await this.redis.set(
+          `transaction:${response.data.transactionId}:reference`,
+          data.reference,
+          'EX',
+          86400,
+        );
+      }
+
+      this.logger.log(`Bank transfer initiated: ${data.reference} to ${data.accountNumber}`);
+      return response.data;
+    } catch (error) {
+      this.logger.error(`Bank transfer failed: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || 'Bank transfer failed',
+        error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  async getTransactions() {
+    try {
+      // Check Redis cache first
+      const cachedTransactions = await this.redis.get('iotec_transactions_cache');
+      if (cachedTransactions) {
+        this.logger.log('Returning cached transactions');
+        return JSON.parse(cachedTransactions);
+      }
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const response = await firstValueFrom(
+        this.http.get(
+          `${this.baseUrl}/transactions`,
+          { headers: headers },
+        ),
+      );
+
+      // Cache the transactions for 5 minutes
+      await this.redis.set(
+        'iotec_transactions_cache',
+        JSON.stringify(response.data),
+        'EX',
+        300,
+      );
+
+      return response.data;
+    } catch (error) {
+      this.logger.error(`Failed to fetch transactions: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || 'Failed to fetch transactions',
+        error.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // 🔍 STATUS CHECK - Check disbursement status via IOTEC API
+  // Uses undici for HTTP requests
+  // Response structure includes: id, status, statusCode, statusMessage, etc.
+  async checkTransactionStatus(transactionId: string) {
+    try {
+      // Check Redis cache first
+      const cachedStatus = await this.redis.get(`transaction:${transactionId}:status`);
+      if (cachedStatus) {
+        this.logger.log(`Returning cached status for transaction: ${transactionId}`);
+        const cachedStatusCode = await this.redis.get(`transaction:${transactionId}:statusCode`);
+        const cachedStatusMessage = await this.redis.get(`transaction:${transactionId}:statusMessage`);
+        return { 
+          transactionId, 
+          status: cachedStatus, 
+          statusCode: cachedStatusCode,
+          statusMessage: cachedStatusMessage,
+          cached: true 
+        };
+      }
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request(`https://pay.iotec.io/api/disbursements/status/${transactionId}`, {
+        method: 'GET',
+        headers: headers,
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Status check failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Status check request failed',
+          statusCode,
+        );
+      }
+
+      // Update cache with latest status from response
+      if (responseBody?.status) {
+        await this.redis.set(
+          `transaction:${transactionId}:status`,
+          responseBody.status,
+          'EX',
+          86400,
+        );
+      }
+      if (responseBody?.statusCode) {
+        await this.redis.set(
+          `transaction:${transactionId}:statusCode`,
+          responseBody.statusCode,
+          'EX',
+          86400,
+        );
+      }
+      if (responseBody?.statusMessage) {
+        await this.redis.set(
+          `transaction:${transactionId}:statusMessage`,
+          responseBody.statusMessage,
+          'EX',
+          86400,
+        );
+      }
+      if (responseBody?.vendorTransactionId) {
+        await this.redis.set(
+          `transaction:${transactionId}:vendorTransactionId`,
+          responseBody.vendorTransactionId,
+          'EX',
+          86400,
+        );
+      }
+
+      this.logger.log(`Status check for ${transactionId}: status=${responseBody?.status}, statusCode=${responseBody?.statusCode}`);
+
+      return {
+        result: responseBody,
+        // Include key fields from response for convenience
+        transactionId: responseBody?.id,
+        status: responseBody?.status,
+        statusCode: responseBody?.statusCode,
+        statusMessage: responseBody?.statusMessage,
+        vendorTransactionId: responseBody?.vendorTransactionId,
+        amount: responseBody?.amount,
+        currency: responseBody?.currency,
+        payee: responseBody?.payee,
+        payeeName: responseBody?.payeeName,
+        category: responseBody?.category,
+        paymentChannel: responseBody?.paymentChannel,
+        externalId: responseBody?.externalId,
+        approvalDecision: responseBody?.approvalDecision,
+        decisionMadeBy: responseBody?.decisionMadeBy,
+        decisionMadeAt: responseBody?.decisionMadeAt,
+        decisionRemarks: responseBody?.decisionRemarks,
+        processedAt: responseBody?.processedAt,
+        lastUpdated: responseBody?.lastUpdated,
+      };
+    } catch (error) {
+      this.logger.error(`Failed to check transaction status: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Failed to check transaction status',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // Method to retrieve all transactions with pagination (similar to airtel.service.ts)
+  public async getAllTransactions(params?: {
+    limit?: number;
+    offset?: number;
+  }): Promise<any[]> {
+    try {
+      // Check Redis cache first
+      const cacheKey = `iotec_all_transactions:${params?.limit || 100}:${params?.offset || 0}`;
+      const cachedTransactions = await this.redis.get(cacheKey);
+      if (cachedTransactions) {
+        this.logger.log('Returning cached all transactions');
+        return JSON.parse(cachedTransactions);
+      }
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const response = await firstValueFrom(
+        this.http.get(`${this.baseUrl}/transactions`, {
+          headers: headers,
+          params: {
+            limit: params?.limit || 100,
+            offset: params?.offset || 0,
+          },
+        }),
+      );
+
+      if (response.data && response.data.transactions) {
+        // Cache for 5 minutes
+        await this.redis.set(
+          cacheKey,
+          JSON.stringify(response.data.transactions),
+          'EX',
+          300,
+        );
+        return response.data.transactions;
+      }
+
+      return [];
+    } catch (error) {
+      this.logger.error(`Failed to fetch all transactions: ${error.message}`);
+      return [];
+    }
+  }
+
+  /**
+   * Get all disbursements via IOTEC API
+   * Uses undici for HTTP requests
+   * Response is an array of disbursement objects with full details
+   */
+  async getAllDisbursements(params?: {
+    limit?: number;
+    offset?: number;
+    status?: string;
+    category?: string;
+    fromDate?: string;
+    toDate?: string;
+  }) {
+    try {
+      // Check Redis cache first
+      const cacheKey = `iotec_all_disbursements:${params?.limit || 100}:${params?.offset || 0}:${params?.status || 'all'}`;
+      const cachedDisbursements = await this.redis.get(cacheKey);
+      if (cachedDisbursements) {
+        this.logger.log('Returning cached disbursements');
+        return JSON.parse(cachedDisbursements);
+      }
+
+      // Build query parameters
+      const queryParams = new URLSearchParams();
+      if (params?.limit) queryParams.append('limit', String(params.limit));
+      if (params?.offset) queryParams.append('offset', String(params.offset));
+      if (params?.status) queryParams.append('status', params.status);
+      if (params?.category) queryParams.append('category', params.category);
+      if (params?.fromDate) queryParams.append('fromDate', params.fromDate);
+      if (params?.toDate) queryParams.append('toDate', params.toDate);
+
+      const queryString = queryParams.toString();
+      const url = `https://pay.iotec.io/api/disbursements${queryString ? `?${queryString}` : ''}`;
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request(url, {
+        method: 'GET',
+        headers: headers,
+      });
+
+      const responseBody = await body.json() as any[];
+
+      if (statusCode >= 400) {
+        this.logger.error(`Get all disbursements failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Get all disbursements request failed',
+          statusCode,
+        );
+      }
+
+      // Cache for 5 minutes
+      await this.redis.set(
+        cacheKey,
+        JSON.stringify(responseBody),
+        'EX',
+        300,
+      );
+
+      this.logger.log(`Retrieved ${Array.isArray(responseBody) ? responseBody.length : 0} disbursements`);
+      
+      return responseBody;
+    } catch (error) {
+      this.logger.error(`Failed to fetch all disbursements: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Failed to fetch all disbursements',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  /**
+   * Get transaction status by transactionId
+   * Uses undici for HTTP requests
+   * Returns full transaction details
+   * @param transactionId - The transaction ID to check
+   * @param type - The type of transaction: 'collection' or 'disbursement' (defaults to 'disbursement')
+   */
+  async getTransactionStatus(transactionId: string, type: 'collection' | 'disbursement' = 'disbursement') {
+    try {
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      // Use the appropriate endpoint based on transaction type
+      const endpoint = type === 'collection' 
+        ? `https://pay.iotec.io/api/collections/status/${transactionId}`
+        : `https://pay.iotec.io/api/disbursements/status/${transactionId}`;
+
+      const { statusCode, body } = await request(endpoint, {
+        method: 'GET',
+        headers: headers,
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Get transaction status failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Get transaction status request failed',
+          statusCode,
+        );
+      }
+
+      this.logger.log(`Retrieved transaction status for ${transactionId}: status=${responseBody?.status}`);
+      
+      return responseBody;
+    } catch (error) {
+      this.logger.error(`Failed to get transaction status: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Failed to get transaction status',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  /**
+   * Get wallet balance by walletId
+   * Uses undici for HTTP requests
+   * Returns wallet balance details
+   */
+  async getWalletBalance(walletId?: string) {
+    try {
+      const targetWalletId = walletId || this.walletId;
+      
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request(`https://pay.iotec.io/api/wallet-balance/${targetWalletId}`, {
+        method: 'GET',
+        headers: headers,
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Get wallet balance failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Get wallet balance request failed',
+          statusCode,
+        );
+      }
+
+      this.logger.log(`Retrieved wallet balance for ${targetWalletId}: balance=${responseBody?.actualBalance}`);
+      
+      return {
+        currency: responseBody?.currency,
+        id: responseBody?.id,
+        name: responseBody?.name,
+        actualBalance: responseBody?.actualBalance,
+      };
+    } catch (error) {
+      this.logger.error(`Failed to get wallet balance: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Failed to get wallet balance',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  /**
+   * Cancel a pending disbursement
+   * Uses undici for HTTP requests
+   * Returns statusCode indicating success
+   */
+  async cancelPendingDisbursement(data: {
+    disbursementId: string;
+    decision: boolean;
+    remarks?: string;
+  }) {
+    try {
+      const payload = {
+        disbursementId: data.disbursementId,
+        decision: data.decision,
+        remarks: data.remarks || '',
+      };
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request('https://pay.iotec.io/api/disbursements/cancel-payment', {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(payload),
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Cancel disbursement failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Cancel disbursement request failed',
+          statusCode,
+        );
+      }
+
+      this.logger.log(`Cancelled disbursement ${data.disbursementId}, statusCode: ${responseBody?.statusCode}`);
+      
+      return {
+        statusCode: responseBody?.statusCode,
+        success: responseBody?.statusCode === 1,
+      };
+    } catch (error) {
+      this.logger.error(`Failed to cancel disbursement: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Failed to cancel disbursement',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  /**
+   * Get paged disbursement request history
+   * Uses undici for HTTP requests
+   * Returns paginated disbursement history with full details
+   */
+  async getPagedRequestHistory(params?: {
+    page?: number;
+    pageSize?: number;
+    status?: string;
+    category?: string;
+    fromDate?: string;
+    toDate?: string;
+  }) {
+    try {
+      // Check Redis cache first
+      const cacheKey = `iotec_paged_history:${params?.page || 1}:${params?.pageSize || 10}:${params?.status || 'all'}`;
+      const cachedHistory = await this.redis.get(cacheKey);
+      if (cachedHistory) {
+        this.logger.log('Returning cached paged history');
+        return JSON.parse(cachedHistory);
+      }
+
+      // Build query parameters
+      const queryParams = new URLSearchParams();
+      if (params?.page) queryParams.append('page', String(params.page));
+      if (params?.pageSize) queryParams.append('pageSize', String(params.pageSize));
+      if (params?.status) queryParams.append('status', params.status);
+      if (params?.category) queryParams.append('category', params.category);
+      if (params?.fromDate) queryParams.append('fromDate', params.fromDate);
+      if (params?.toDate) queryParams.append('toDate', params.toDate);
+
+      const queryString = queryParams.toString();
+      const url = `https://pay.iotec.io/api/disbursements/paged-history${queryString ? `?${queryString}` : ''}`;
+
+      // Get valid access token
+      const headers = await this.getHeaders();
+
+      const { statusCode, body } = await request(url, {
+        method: 'GET',
+        headers: headers,
+      });
+
+      const responseBody = await body.json() as any;
+
+      if (statusCode >= 400) {
+        this.logger.error(`Get paged history failed with status ${statusCode}: ${JSON.stringify(responseBody)}`);
+        throw new HttpException(
+          responseBody || 'Get paged history request failed',
+          statusCode,
+        );
+      }
+
+      // Cache for 5 minutes
+      await this.redis.set(
+        cacheKey,
+        JSON.stringify(responseBody),
+        'EX',
+        300,
+      );
+
+      this.logger.log(`Retrieved paged history: page ${responseBody?.page} of ${responseBody?.totalPages}, total ${responseBody?.total} records`);
+      
+      return {
+        page: responseBody?.page,
+        totalPages: responseBody?.totalPages,
+        total: responseBody?.total,
+        data: responseBody?.data,
+        hasPreviousPage: responseBody?.hasPreviousPage,
+        hasNextPage: responseBody?.hasNextPage,
+      };
+    } catch (error) {
+      this.logger.error(`Failed to fetch paged history: ${error.message}`);
+      throw new HttpException(
+        error.response?.data || error.message || 'Failed to fetch paged history',
+        error.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // Helper method to get transaction metadata from Redis
+  async getTransactionMetadata(transactionId: string): Promise<{
+    phone?: string;
+    type?: string;
+    reference?: string;
+    status?: string;
+  }> {
+    const [phone, type, reference, status] = await Promise.all([
+      this.redis.get(`transaction:${transactionId}:phone`),
+      this.redis.get(`transaction:${transactionId}:type`),
+      this.redis.get(`transaction:${transactionId}:reference`),
+      this.redis.get(`transaction:${transactionId}:status`),
+    ]);
+
+    return { 
+      phone: phone ?? undefined, 
+      type: type ?? undefined, 
+      reference: reference ?? undefined, 
+      status: status ?? undefined 
+    };
+  }
+}
